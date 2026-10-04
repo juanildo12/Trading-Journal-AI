@@ -8,10 +8,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /docs
-    disk:
-      name: trading-journal-ai-data
-      mountPath: /opt/render/project/src/backend
-      sizeGB: 1
     envVars:
       - key: FRONTEND_ORIGINS
         sync: false
