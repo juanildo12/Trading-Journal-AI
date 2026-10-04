@@ -7,32 +7,20 @@
       "config": {
         "distDir": "build"
       }
+    },
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
     }
   ],
   "routes": [
-    {
-      "src": "/static/(.*)",
-      "dest": "frontend/static/$1"
-    },
-    {
-      "src": "/favicon.ico",
-      "dest": "frontend/favicon.ico"
-    },
-    {
-      "src": "/manifest.json",
-      "dest": "frontend/manifest.json"
-    },
-    {
-      "src": "/robots.txt",
-      "dest": "frontend/robots.txt"
-    },
-    {
-      "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|json|map))$",
-      "dest": "frontend/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "frontend/index.html"
-    }
+    { "src": "/api/(.*)", "dest": "api/index.py" },
+    { "src": "/docs", "dest": "api/index.py" },
+    { "src": "/redoc", "dest": "api/index.py" },
+    { "src": "/openapi.json", "dest": "api/index.py" },
+    { "src": "/uploads/(.*)", "dest": "api/index.py" },
+    { "src": "/static/(.*)", "dest": "frontend/static/$1" },
+    { "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|json|map))$", "dest": "frontend/$1" },
+    { "src": "/(.*)", "dest": "frontend/index.html" }
   ]
 }
