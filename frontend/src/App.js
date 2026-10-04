@@ -113,6 +113,7 @@ export default function App() {
             key={selectedTrade.id}
             trade={selectedTrade}
             tradeNavList={tradeNavList}
+            accounts={accounts}
             onBack={() => { setSelectedTrade(null); setPage('trades'); }}
             onTradeUpdate={(updated) => setSelectedTrade(updated)}
             onNavigate={(trade) => setSelectedTrade(trade)}

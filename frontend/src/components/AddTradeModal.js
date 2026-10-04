@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { X } from 'lucide-react';
 import { tradesApi } from '../api';
+import { contractMultiplier, OPTION_SHARES_PER_CONTRACT } from '../instruments';
 import useModalFocus from './useModalFocus';
 
 export default function AddTradeModal({ accounts, defaultAccountId, onClose, onSaved }) {
@@ -17,7 +18,6 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
     commissions: 0,
     strategy: '',
     stop_loss: '',
-    risk_per_trade: '',
     notes: '',
   });
   const [saving, setSaving] = useState(false);
@@ -26,17 +26,29 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
   const update = (field, value) => setForm(p => ({ ...p, [field]: value }));
   const dialogRef = useModalFocus(onClose);
 
+  // One option contract is 100 shares, so the preview has to carry it or it shows a number a
+  // hundred times too small. Futures are quoted per point and the multiplier belongs to the
+  // contract, so the backend owns that number and the preview stays out of the way.
+  const multiplier = contractMultiplier(form.instrument_type);
+  const isFuture = form.instrument_type === 'FUTURE';
+
   const previewPnl = () => {
     const entry = parseFloat(form.entry_price);
     const exit = parseFloat(form.exit_price);
     const qty = parseInt(form.quantity);
     const comm = parseFloat(form.commissions) || 0;
-    if (!entry || !exit || !qty) return null;
+    if (!entry || !exit || !qty || !multiplier) return null;
     const gross = form.side === 'LONG' ? (exit - entry) * qty : (entry - exit) * qty;
-    return (gross - comm).toFixed(2);
+    return (gross * multiplier - comm).toFixed(2);
   };
 
   const pnl = previewPnl();
+  const hasBothPrices = parseFloat(form.entry_price) && parseFloat(form.exit_price) && parseInt(form.quantity);
+  const pnlNote = isFuture && hasBothPrices
+    ? 'Not previewed for futures: the contract multiplier is applied when the trade is saved.'
+    : (pnl !== null && multiplier === OPTION_SHARES_PER_CONTRACT
+        ? `${form.quantity} contracts × ${OPTION_SHARES_PER_CONTRACT} shares`
+        : null);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -168,11 +180,18 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
             />
           </div>
 
-          {pnl != null && (
-            <div className={`notice ${Number(pnl) >= 0 ? 'pos' : 'neg'}`} style={{ marginTop: 14 }} aria-live="polite">
-              Estimated Net P&L: <strong className={`num ${Number(pnl) >= 0 ? 'pos' : 'neg'}`}>
-                {Number(pnl) >= 0 ? '+' : '-'}${Math.abs(Number(pnl)).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-              </strong>
+          {(pnl != null || pnlNote) && (
+            <div
+              className={`notice ${pnl != null ? (Number(pnl) >= 0 ? 'pos' : 'neg') : ''}`}
+              style={{ marginTop: 14 }}
+              aria-live="polite"
+            >
+              {pnl != null && (
+                <>Estimated Net P&L: <strong className={`num ${Number(pnl) >= 0 ? 'pos' : 'neg'}`}>
+                  {Number(pnl) >= 0 ? '+' : '-'}${Math.abs(Number(pnl)).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                </strong></>
+              )}
+              {pnlNote && <div style={{ marginTop: 4, fontSize: '0.9em' }}>{pnlNote}</div>}
             </div>
           )}
 

@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ArrowLeft, ChevronLeft, ChevronRight, PlusCircle, Trash2, Pencil } from 'lucide-react';
 import { tradesApi, chartApi } from '../api';
 import TradingChart from './TradingChart';
+import EditTradeModal from './EditTradeModal';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
+import { sharesBehind } from '../instruments';
 
 const fmt$ = (v) => {
   if (v == null) return '—';
@@ -38,8 +40,12 @@ function computeStats(trade) {
   const avgEntry = avgPrice(entryFills);
   const avgExit  = avgPrice(exitFills);
   const totalQty = entryFills.reduce((s, f) => s + (f.qty || 0), 0);
-  const adjustedCost = avgEntry ? avgEntry * totalQty : null;
-  const netRoi = adjustedCost ? (trade.net_pnl / adjustedCost * 100) : null;
+  // A price is per share and a fill is in contracts, so anything that turns one into money has to go
+  // through the multiplier. For an option this is where the x100 lives; without it the ROI came out
+  // 100x too high, because net_pnl comes from the backend with the multiplier and the cost did not.
+  const shares = sharesBehind(trade.instrument_type, totalQty);
+  const adjustedCost = avgEntry != null && shares ? avgEntry * shares : null;
+  const netRoi = adjustedCost && trade.net_pnl != null ? trade.net_pnl / adjustedCost * 100 : null;
 
   const sortedTimes = [...execs].map(e => e.time).filter(Boolean).sort();
   const openTime  = sortedTimes[0];
@@ -61,10 +67,21 @@ function computeStats(trade) {
   const isClosed = exitFills.length > 0;
   const isWin = (trade.net_pnl || 0) > 0;
 
-  return { avgEntry, avgExit, totalQty, adjustedCost, netRoi, openTime, closeTime, holdMinutes, fmtHold, isClosed, isWin, entryFills, exitFills };
+  // The position a fill holds in the whole list, which is what the executions endpoints address it
+  // by. Inline price editing needs it, so it rides along on the legs.
+  const exitFillsWithIdx = exitFills.map(f => ({ ...f, idx: execs.indexOf(f) }));
+
+  return { avgEntry, avgExit, totalQty, shares, adjustedCost, netRoi, openTime, closeTime, holdMinutes, fmtHold, isClosed, isWin, entryFills, exitFills: exitFillsWithIdx };
 }
 
 // ── Stat row helper ────────────────────────────────────────────────────────────
+
+/** A fill is in shares only for a stock. Anything else is counted in its own unit. */
+function sizeLabel(trade) {
+  if (trade.instrument_type === 'OPTION') return 'Contracts traded';
+  if (trade.instrument_type === 'FUTURE') return 'Contracts traded';
+  return 'Stocks traded';
+}
 
 function StatRow({ label, value, valueColor }) {
   if (value == null || value === '—' || value === '') return null;
@@ -216,6 +233,10 @@ function getPriceAt(bars, hhmm) {
 function computeWhatIf(bars, stats, trade) {
   if (!bars.length || !stats.isClosed || !stats.avgExit || !stats.closeTime) return null;
   const [exitH, exitM] = stats.closeTime.split(':').map(Number);
+  // Deliberately stocks only, and not a shortcut around contractMultiplier: these bars are the
+  // UNDERLYING's price, and a dollar move in the underlying is not a dollar move in its option.
+  // That needs the delta, which the app does not have. Multiplying by 100 here would be wrong in
+  // the same way as the old bug but look correct.
   const isStock  = !trade.instrument_type || trade.instrument_type === 'STOCK';
   const sideSign = trade.side === 'LONG' ? 1 : -1;
 
@@ -302,14 +323,20 @@ function DaySidebar({ currentTrade, onOpenDetail }) {
   );
 }
 
-export default function TradeDetail({ trade: initialTrade, tradeNavList = [], onBack, onTradeUpdate, onNavigate, onOpenDetail }) {
+export default function TradeDetail({ trade: initialTrade, tradeNavList = [], accounts = [], onBack, onTradeUpdate, onNavigate, onOpenDetail }) {
   const [trade, setTrade] = useState(initialTrade);
   const [tab, setTab] = useState('Stats');
   const [analysis, setAnalysis] = useState(null);
   const [tags, setTags] = useState([]);
+  const [showEditTrade, setShowEditTrade] = useState(false);
 
   // Executions
   const [showAddExec, setShowAddExec]     = useState(false);
+  // Inline price editing: { idx, value } for the cell being typed into, so a price can be corrected
+  // where it is shown. Enter or clicking away saves, Escape gives up on it.
+  const [inlinePrice, setInlinePrice]     = useState(null);
+  const [savingPrice, setSavingPrice]     = useState(false);
+  const priceLock = useRef(0);
   const [execForm, setExecForm]           = useState(EMPTY_EXEC);
   const [addingExec, setAddingExec]       = useState(false);
   const [execError, setExecError]         = useState(null);
@@ -386,6 +413,36 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
     }
   };
 
+  const saveInlinePrice = async (idx, ex, value) => {
+    const next = Number(value);
+    // Enter then a click-away both land here for the same cell, so one edit is one request.
+    if (priceLock.current === idx) return;
+    if (!Number.isFinite(next) || next < 0 || next === Number(ex.price)) {
+      setInlinePrice(null);
+      return;
+    }
+    priceLock.current = idx;
+    setSavingPrice(true);
+    setExecError(null);
+    try {
+      const res = await tradesApi.updateExecution(trade.id, idx, {
+        ...ex,
+        qty: Number(ex.qty),
+        price: next,
+        commission: Number(ex.commission || 0),
+        date: ex.date || trade.date,
+      });
+      setTrade(res.data);
+      if (onTradeUpdate) onTradeUpdate(res.data);
+      setInlinePrice(null);
+    } catch (e) {
+      setExecError(e.response?.data?.detail || e.message);
+    } finally {
+      setSavingPrice(false);
+      priceLock.current = -1;
+    }
+  };
+
   const handleSaveEditExec = async () => {
     if (!editExecForm) return;
     setSavingEditExec(true);
@@ -412,6 +469,23 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
   // ── Analysis handlers ─────────────────────────────────────────────────────
 
   const toNum = v => (v === '' || v == null) ? null : (parseFloat(v) || null);
+
+  // The list endpoint adds the analysis columns on top of the trade row, so the
+  // response of a write has to be merged over the trade rather than replace it.
+  const applyTradeUpdate = (updated) => {
+    setTrade(prev => ({ ...prev, ...updated }));
+    if (onTradeUpdate) onTradeUpdate({ ...trade, ...updated });
+  };
+
+  const handleTradeSaved = (updated) => {
+    setShowEditTrade(false);
+    applyTradeUpdate(updated);
+    // The edit form writes the review fields too, so the Stats and Strategy tabs have to pick the
+    // new ones up rather than keep showing what was there when the page loaded.
+    tradesApi.getAnalysis(updated.trade_group)
+      .then(r => setAnalysis(r.data.analysis))
+      .catch(() => {});
+  };
 
   const handleSaveStats = async () => {
     setSavingStats(true);
@@ -494,8 +568,10 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
 
   const riskPerShare = analysis?.stop_loss && stats.avgEntry
     ? Math.abs(stats.avgEntry - analysis.stop_loss) : null;
-  const tradeRisk = riskPerShare && stats.totalQty
-    ? -(riskPerShare * stats.totalQty) : analysis?.risk_per_trade ? -Math.abs(analysis.risk_per_trade) : null;
+  // Same multiplier as the P&L: an option's stop is a per-share distance across 100 shares a
+  // contract, so a 0.10 stop on 10 lots is a $100 risk, not a $1 one.
+  const tradeRisk = riskPerShare && stats.shares
+    ? -(riskPerShare * stats.shares) : analysis?.risk_per_trade ? -Math.abs(analysis.risk_per_trade) : null;
   const plannedR  = analysis?.risk_reward ? `${Number(analysis.risk_reward).toFixed(2)}R` : null;
   const realizedR = analysis?.r_multiple != null ? `${Number(analysis.r_multiple).toFixed(2)}R` : null;
 
@@ -531,29 +607,39 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           {stats.closeTime && stats.isClosed && <> · Closed <span className="num">{stats.closeTime.slice(0, 5)}</span></>}
           {stats.holdMinutes != null && <> · Held <span className="num">{stats.fmtHold(stats.holdMinutes)}</span></>}
         </>}
-        actions={tradeNavList.length > 1 ? <>
+        actions={<>
           <button
             type="button"
             className="btn btn-secondary"
-            onClick={() => goTo(navIdx - 1)}
-            disabled={!hasPrev}
-            title="Previous trade"
+            onClick={() => setShowEditTrade(true)}
+            title="Edit this trade"
           >
-            <ChevronLeft size={16} /> Previous trade
+            <Pencil size={15} /> Edit trade
           </button>
-          <span className="num text-muted" style={{ fontSize: 13, minWidth: 54, textAlign: 'center' }} aria-live="polite">
-            {navIdx + 1} / {tradeNavList.length}
-          </span>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => goTo(navIdx + 1)}
-            disabled={!hasNext}
-            title="Next trade"
-          >
-            Next trade <ChevronRight size={16} />
-          </button>
-        </> : null}
+          {tradeNavList.length > 1 && <>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => goTo(navIdx - 1)}
+              disabled={!hasPrev}
+              title="Previous trade"
+            >
+              <ChevronLeft size={16} /> Previous trade
+            </button>
+            <span className="num text-muted" style={{ fontSize: 13, minWidth: 54, textAlign: 'center' }} aria-live="polite">
+              {navIdx + 1} / {tradeNavList.length}
+            </span>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => goTo(navIdx + 1)}
+              disabled={!hasNext}
+              title="Next trade"
+            >
+              Next trade <ChevronRight size={16} />
+            </button>
+          </>}
+        </>}
       >
         <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
           <span className="chip">{trade.side}</span>
@@ -582,7 +668,18 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           foot={plannedR ? <>Planned <span className="num">{plannedR}</span></> : null}
         />
         <KpiCell label="Avg entry" value={<span className="num">{stats.avgEntry ? `$${stats.avgEntry.toFixed(2)}` : 'n/a'}</span>} />
-        <KpiCell label="Avg exit" value={<span className="num">{stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : 'n/a'}</span>} />
+        {/* Both averages point at the fills they come from, so a correction is one click away
+            rather than something to go hunting for in the Executions tab. */}
+        <KpiCell label="Avg exit" value={
+          <button
+            type="button"
+            onClick={() => { setTab('Executions'); setInlinePrice({ idx: stats.exitFills[0].idx, value: String(stats.exitFills[0].price ?? '') }); }}
+            title="Edit the exit price in Executions"
+            style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', font: 'inherit', cursor: 'pointer', textDecoration: 'underline dotted' }}
+          >
+            <span className="num">{stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : 'n/a'}</span>
+          </button>
+        } />
         <KpiCell label="Quantity" value={<span className="num">{stats.totalQty || 'n/a'}</span>} foot={trade.commissions ? <>Comm <span className="num">{fmt$(trade.commissions)}</span></> : null} />
         <KpiCell label="Risk" value={<span className="num">{tradeRisk ? fmt$(tradeRisk) : 'n/a'}</span>} />
       </KpiStrip>
@@ -664,13 +761,22 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 </div>
 
                 <StatRow label="Side" value={trade.side} />
-                <StatRow label="Stocks traded" value={stats.totalQty || '—'} />
+                <StatRow label={sizeLabel(trade)} value={stats.totalQty || '—'} />
                 <StatRow label="Commissions & Fees" value={trade.commissions ? fmt$(trade.commissions) : '—'} />
                 <StatRow label="Net ROI" value={stats.netRoi != null ? `${stats.netRoi >= 0 ? '+' : ''}${stats.netRoi.toFixed(2)}%` : '—'} valueColor={stats.netRoi != null ? (stats.netRoi >= 0 ? 'var(--green)' : 'var(--red)') : undefined} />
                 <StatRow label="Gross P&L" value={trade.gross_pnl != null ? fmt$(trade.gross_pnl) : '—'} valueColor={trade.gross_pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
                 <StatRow label="Adjusted Cost" value={stats.adjustedCost ? fmt$(stats.adjustedCost) : '—'} />
                 <StatRow label="Average Entry" value={stats.avgEntry ? `$${stats.avgEntry.toFixed(2)}` : '—'} />
-                <StatRow label="Average Exit" value={stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : '—'} />
+                <StatRow label="Average Exit" value={
+                  <button
+                    type="button"
+                    onClick={() => { setTab('Executions'); setInlinePrice({ idx: stats.exitFills[0].idx, value: String(stats.exitFills[0].price ?? '') }); }}
+                    title="Edit the exit price in Executions"
+                    style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', font: 'inherit', cursor: 'pointer', textDecoration: 'underline dotted' }}
+                  >
+                    {stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : '—'}
+                  </button>
+                } />
                 <StatRow label="Entry Time" value={stats.openTime?.slice(0, 5) || '—'} />
                 <StatRow label="Exit Time" value={(stats.isClosed && stats.closeTime?.slice(0, 5)) || '—'} />
                 <StatRow label="Hold Time" value={stats.fmtHold(stats.holdMinutes)} />
@@ -866,7 +972,40 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         <td className="mono" style={{ fontSize: 13.5, whiteSpace: 'nowrap' }}>{ex.time?.slice(0, 5) || '—'}</td>
                         <td style={{ whiteSpace: 'nowrap' }}>{ex.action}</td>
                         <td className="num mono" style={{ fontSize: 13.5 }}>{ex.qty}</td>
-                        <td className="num mono" style={{ fontSize: 13.5 }}>${Number(ex.price ?? 0).toFixed(2)}</td>
+                        {/* The price is editable in place, so correcting a fill does not mean
+                            finding the pencil and opening a panel. */}
+                        <td className="num mono" style={{ fontSize: 13.5, padding: '2px 0' }}>
+                          {inlinePrice?.idx === i ? (
+                            <input
+                              autoFocus
+                              aria-label={`Price of execution ${i + 1}`}
+                              type="number" min="0" step="0.01"
+                              value={inlinePrice.value}
+                              onChange={e => setInlinePrice(p => ({ ...p, value: e.target.value }))}
+                              onBlur={e => saveInlinePrice(i, ex, e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') { e.preventDefault(); saveInlinePrice(i, ex, e.currentTarget.value); }
+                                if (e.key === 'Escape') setInlinePrice(null);
+                              }}
+                              style={{ width: 78, textAlign: 'right', padding: '2px 4px' }}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setInlinePrice({ idx: i, value: String(ex.price ?? '') })}
+                              aria-label={`Edit price of execution ${i + 1}`}
+                              title="Edit price"
+                              style={{
+                                background: 'none', border: 'none', padding: '2px 4px', cursor: 'pointer',
+                                color: 'inherit', font: 'inherit', borderRadius: 3,
+                              }}
+                              onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-inset)'; }}
+                              onMouseLeave={e => { e.currentTarget.style.background = 'none'; }}
+                            >
+                              ${Number(ex.price ?? 0).toFixed(2)}
+                            </button>
+                          )}
+                        </td>
                         <td className="num mono text-muted" style={{ fontSize: 13.5 }}>{ex.commission ? `$${Number(ex.commission).toFixed(2)}` : '—'}</td>
                         <td className="num" style={{ whiteSpace: 'nowrap', paddingRight: 20 }}>
                           <button
@@ -895,6 +1034,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 <div className="text-muted" style={{ fontSize: 13, marginTop: 10 }}>
                   Gross <span className="num">{trade.gross_pnl != null ? fmtSigned$(trade.gross_pnl) : 'n/a'}</span>
                   {' · '}Commissions <span className="num">{trade.commissions ? fmt$(trade.commissions) : '$0.00'}</span>
+                  {savingPrice && <span style={{ marginLeft: 10 }}>Saving…</span>}
+                  {' · '}Click any price to correct it.
                 </div>
 
                 {/* Edit Execution inline panel */}
@@ -940,14 +1081,33 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
 
                 {/* Add Execution */}
                 {!showAddExec ? (
-                  <button
-                    type="button"
-                    onClick={() => { setShowAddExec(true); setEditingExecIdx(null); setEditExecForm(null); }}
-                    className="btn btn-ghost"
-                    style={{ marginTop: 12, color: 'var(--accent-line)', paddingLeft: 6 }}
-                  >
-                    <PlusCircle size={15} /> Add Execution
-                  </button>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 12, paddingLeft: 6, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => { setShowAddExec(true); setEditingExecIdx(null); setEditExecForm(null); }}
+                      className="btn btn-ghost"
+                      style={{ color: 'var(--accent-line)', paddingLeft: 6 }}
+                    >
+                      <PlusCircle size={15} /> Add Execution
+                    </button>
+                    {/* An open position has no exit fill to correct, so recording the price it was
+                        taken at is one click rather than a second form. */}
+                    {!stats.isClosed && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowAddExec(true);
+                          setExecForm({ ...EMPTY_EXEC, action: trade.side === 'SHORT' ? 'BOT' : 'SOLD', qty: stats.totalQty, date: trade.date });
+                          setEditingExecIdx(null);
+                          setEditExecForm(null);
+                        }}
+                        className="btn btn-ghost"
+                        style={{ color: 'var(--accent-line)', paddingLeft: 6 }}
+                      >
+                        <PlusCircle size={15} /> Record exit price
+                      </button>
+                    )}
+                  </div>
                 ) : (
                   <div style={editPanelStyle}>
                     <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 10, color: 'var(--text-primary)' }}>Add Execution</div>
@@ -1186,6 +1346,17 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           </div>
         </div>
       </div>
+
+      {showEditTrade && (
+        <EditTradeModal
+          trade={trade}
+          analysis={analysis}
+          accounts={accounts}
+          onClose={() => setShowEditTrade(false)}
+          onSaved={handleTradeSaved}
+          onDeleted={() => { setShowEditTrade(false); if (onBack) onBack(); }}
+        />
+      )}
     </div>
   );
 }

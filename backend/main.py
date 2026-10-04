@@ -10,13 +10,13 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 import httpx
 
 from database import init_db, get_db, row_to_dict
-from csv_parser import parse_broker_csv, FUTURES_MULTIPLIERS
+from csv_parser import parse_broker_csv, contract_multiplier
 from ai_analysis import (
     analyze_diary_entry,
     analyze_diary_text,
@@ -219,6 +219,37 @@ def update_account(account_id: int, data: AccountUpdate, conn: sqlite3.Connectio
 
     row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
     return row_to_dict(row)
+
+
+@app.delete("/api/accounts/{account_id}")
+def delete_account(account_id: int, conn: sqlite3.Connection = Depends(get_connection)):
+    """Remove an account, but not the record it holds.
+
+    A journal is the one place where quietly cascading a delete would cost real work, so this
+    refuses while there is anything in it and says how much. The daily summaries go regardless:
+    they are generated text, not something anyone typed.
+    """
+    row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    trades = conn.execute("SELECT COUNT(*) FROM trades WHERE account_id=?", (account_id,)).fetchone()[0]
+    entries = conn.execute("SELECT COUNT(*) FROM diary_entries WHERE account_id=?", (account_id,)).fetchone()[0]
+    if trades or entries:
+        parts = []
+        if trades:
+            parts.append(f"{trades} trade{'s' if trades != 1 else ''}")
+        if entries:
+            parts.append(f"{entries} diary entr{'ies' if entries != 1 else 'y'}")
+        raise HTTPException(status_code=409, detail=(
+            f"'{row['name']}' still holds {' and '.join(parts)}. Delete those first, or rename the account."
+        ))
+
+    conn.execute("DELETE FROM daily_summaries WHERE account_id=?", (account_id,))
+    conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+    conn.commit()
+
+    return {"deleted": True, "id": account_id}
 
 
 @app.post("/api/accounts", status_code=201)
@@ -490,7 +521,7 @@ class TradeCreate(BaseModel):
     commissions: float = 0.0
     strategy: str | None = None
     stop_loss: float | None = None
-    risk_per_trade: str | None = None
+    risk_per_trade: float | None = None
     notes: str | None = None
     option_expiry: str | None = None
     option_strike: float | None = None
@@ -498,13 +529,22 @@ class TradeCreate(BaseModel):
     time: str | None = None
 
 
-def compute_manual_pnl(side: str, entry: float, exit_price: float | None, qty: int, commissions: float) -> tuple[float, float]:
+def compute_manual_pnl(side: str, entry: float, exit_price: float | None, qty: int, commissions: float,
+                       ticker: str = '', instrument_type: str = 'STOCK') -> tuple[float, float]:
+    """Gross and net for a trade typed in by hand rather than imported.
+
+    The multiplier belongs here, not only in the fill recalculation: without it a 10-lot option
+    trade is stored as a 10-share trade, and the stored P&L then jumps a hundredfold the moment
+    anyone edits a price. Commissions are already dollars, so they are never multiplied.
+    """
     if exit_price is None:
         return 0.0, -commissions
+    # An unknown future root falls back to 1, the same assumption the stored price move makes.
+    multiplier = contract_multiplier(ticker, instrument_type) or 1
     if side.upper() == 'LONG':
-        gross = (exit_price - entry) * qty
+        gross = (exit_price - entry) * qty * multiplier
     else:
-        gross = (entry - exit_price) * qty
+        gross = (entry - exit_price) * qty * multiplier
     return round(gross, 2), round(gross - commissions, 2)
 
 
@@ -583,7 +623,8 @@ def create_trade(data: TradeCreate, conn: sqlite3.Connection = Depends(get_conne
         raise ValueError(f"Account {data.account_id} not found")
 
     gross_pnl, net_pnl = compute_manual_pnl(
-        data.side, data.entry_price, data.exit_price, data.quantity, data.commissions
+        data.side, data.entry_price, data.exit_price, data.quantity, data.commissions,
+        data.ticker, data.instrument_type,
     )
 
     # Build a manual trade group key
@@ -633,20 +674,323 @@ def create_trade(data: TradeCreate, conn: sqlite3.Connection = Depends(get_conne
         conn.commit()
 
     row = conn.execute("SELECT * FROM trades WHERE id=?", (cursor.lastrowid,)).fetchone()
-    return row_to_dict(row)
+    trade = row_to_dict(row)
+    # The other trade endpoints decode this on the way out, so the create response does too.
+    # Otherwise a caller gets a JSON string back here and an array everywhere else.
+    trade['executions'] = json.loads(trade.get('executions') or '[]')
+    return trade
+
+
+INSTRUMENT_TYPES = ('STOCK', 'OPTION', 'FUTURE')
+TRADE_SIDES = ('LONG', 'SHORT')
+OPTION_TYPES = ('CALL', 'PUT')
+
+
+class TradeUpdate(BaseModel):
+    """Every field is optional: only the ones you send are written.
+
+    This carries every field `TradeCreate` accepts, so a trade can be corrected without having to
+    remember which half of the form it came from. The ones that move money — `entry_price`,
+    `exit_price`, `quantity`, `commissions` and `time` — rewrite the fills underneath and the P&L
+    is recalculated from those. Send `exit_price` as null to reopen a closed trade.
+
+    `strategy`, `stop_loss`, `risk_per_trade` and `notes` live in `trade_analysis`, not on the
+    trade, so they are written there and read back through the same join as the Strategy tab.
+
+    `gross_pnl` and `net_pnl` are only for a trade with no fills to derive them from.
+    `trade_group` is deliberately absent: it is the key the analysis and the tags hang off, and the
+    frontend keeps using the value it already holds, so it has to stay stable.
+    """
+    ticker: str | None = None
+    side: str | None = None
+    date: str | None = None
+    time: str | None = None
+    instrument_type: str | None = None
+    option_expiry: str | None = None
+    option_strike: float | None = None
+    option_type: str | None = None
+    account_id: int | None = None
+    entry_price: float | None = None
+    exit_price: float | None = None
+    quantity: int | None = None
+    gross_pnl: float | None = None
+    net_pnl: float | None = None
+    commissions: float | None = None
+    strategy: str | None = None
+    stop_loss: float | None = None
+    risk_per_trade: float | None = None
+    notes: str | None = None
+
+
+    @field_validator('ticker')
+    @classmethod
+    def _clean_ticker(cls, v):
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("ticker cannot be empty")
+        return v
+
+    @field_validator('side')
+    @classmethod
+    def _check_side(cls, v):
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if v not in TRADE_SIDES:
+            raise ValueError(f"side must be one of {list(TRADE_SIDES)}")
+        return v
+
+    @field_validator('instrument_type')
+    @classmethod
+    def _check_instrument(cls, v):
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if v not in INSTRUMENT_TYPES:
+            raise ValueError(f"instrument_type must be one of {list(INSTRUMENT_TYPES)}")
+        return v
+
+    @field_validator('option_type')
+    @classmethod
+    def _check_option_type(cls, v):
+        if v is None or v == '':
+            return None
+        v = v.strip().upper()
+        if v not in OPTION_TYPES:
+            raise ValueError(f"option_type must be one of {list(OPTION_TYPES)}")
+        return v
+
+    @field_validator('date')
+    @classmethod
+    def _check_date(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        try:
+            datetime.strptime(v, '%Y-%m-%d')
+        except ValueError:
+            raise ValueError("date must look like YYYY-MM-DD")
+        return v
+
+    @field_validator('time')
+    @classmethod
+    def _check_time(cls, v):
+        """Fills store HH:MM:SS but an <input type="time"> hands over HH:MM, so pad it here."""
+        if v is None:
+            return v
+        v = v.strip()
+        for fmt in ('%H:%M:%S', '%H:%M'):
+            try:
+                return datetime.strptime(v, fmt).strftime('%H:%M:%S')
+            except ValueError:
+                continue
+        raise ValueError("time must look like HH:MM or HH:MM:SS")
+
+    @field_validator('option_strike', 'commissions', 'entry_price', 'exit_price')
+    @classmethod
+    def _check_positive(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("must be zero or greater")
+        return v
+
+    @field_validator('quantity')
+    @classmethod
+    def _check_quantity(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("quantity must be at least 1")
+        return v
+
+
+def _trade_payload(row) -> dict:
+    """A trade row with `executions` decoded, the same shape GET /api/trades returns."""
+    trade = row_to_dict(row)
+    try:
+        trade['executions'] = json.loads(trade.get('executions') or '[]')
+    except (TypeError, json.JSONDecodeError):
+        trade['executions'] = []
+    return trade
+
+
+# ── Rewriting fills from an average price and a size ───────────────────────────
+#
+# The journal reports an average entry and an average exit, not one price per fill, so those are
+# what the edit form shows. Turning one typed number back into a set of fills has two rules:
+# every fill of a leg moves by the same delta, so a scale-in keeps its spread instead of
+# collapsing onto a single price, and the quantities scale proportionally, so the shape of the
+# scale-in survives a size change too.
+
+def _leg_actions(side: str) -> tuple[str, str]:
+    return ('BOT', 'SOLD') if side == 'LONG' else ('SOLD', 'BOT')
+
+
+def _weighted_avg(fills: list) -> float | None:
+    qty = sum(f['qty'] for f in fills)
+    if not qty:
+        return None
+    return sum(f['qty'] * f['price'] for f in fills) / qty
+
+
+def _shift_leg(fills: list, target_price: float) -> None:
+    """Move every fill of one leg so the weighted average lands on `target_price`."""
+    current = _weighted_avg(fills)
+    if current is None:
+        return
+    delta = target_price - current
+    for f in fills:
+        f['price'] = round(f['price'] + delta, 4)
+    # Rounding the fills left a sliver of drift. Put it on the biggest one so the average the
+    # user typed is the average the journal goes on to report.
+    drift = (target_price - _weighted_avg(fills)) * sum(f['qty'] for f in fills)
+    if abs(drift) > 1e-9:
+        biggest = max(fills, key=lambda f: f['qty'])
+        biggest['price'] = round(biggest['price'] + drift / biggest['qty'], 6)
+
+
+def _scale_quantities(execs: list, quantity: int, entry_action: str) -> list:
+    """Scale every fill so the position is the size asked for, keeping the shape of a scale-in.
+
+    The size of a trade is what its entry leg adds up to, so that is what the factor comes from.
+    The exit leg is scaled by the same factor, which keeps a closed position closed.
+    """
+    entry_qty = sum(e['qty'] for e in execs if e['action'] == entry_action)
+    if not entry_qty or entry_qty == quantity:
+        return execs
+    factor = quantity / entry_qty
+    scaled = [dict(e, qty=int(e['qty'] * factor)) for e in execs]
+    # Hand the rounding remainder to the biggest entry fill so the size asked for is the size
+    # stored, not one share out.
+    drift = quantity - sum(e['qty'] for e in scaled if e['action'] == entry_action)
+    if drift:
+        entries = [e for e in scaled if e['action'] == entry_action]
+        max(entries, key=lambda f: f['qty'])['qty'] += drift
+    # A fill that rounds away to nothing is noise, not a trade.
+    return [e for e in scaled if e['qty'] > 0]
+
+
+def _apply_pricing(trade: dict, execs: list, pricing: dict) -> list:
+    """Rewrite the fills so the trade reads back at the prices and the size the user typed.
+
+    `pricing` is keyed on what was actually sent, so an `exit_price` of null means "reopen this
+    trade" rather than "leave the exit alone".
+    """
+    entry_action, exit_action = _leg_actions(trade['side'])
+    entry_price = pricing.get('entry_price')
+    exit_price = pricing.get('exit_price')
+    quantity = pricing.get('quantity')
+    new_time = pricing.get('time')
+    total_fees = pricing.get('commissions')
+
+    if quantity is not None:
+        execs = _scale_quantities(execs, quantity, entry_action)
+
+    # A hand-typed trade is one moment, so every fill moves to the typed time. An imported trade can
+    # have scale-ins hours apart, and flattening those to one clock time would lose real information.
+    if new_time is not None and len(execs) > 0:
+        for e in execs:
+            e['time'] = new_time
+
+    if 'exit_price' in pricing and exit_price is None:
+        # An explicit null reopens the trade: the exit leg goes, and with it the realized P&L.
+        execs = [e for e in execs if e['action'] != exit_action]
+
+    for action, target in ((entry_action, entry_price), (exit_action, exit_price)):
+        if target is None:
+            continue
+        fills = [e for e in execs if e['action'] == action]
+        if fills:
+            _shift_leg(fills, target)
+            continue
+        # This leg has no fill yet. An entry makes one at the size asked for; an exit only makes
+        # one if there is still stock to sell, which is what recording an exit does.
+        if action == exit_action:
+            open_qty = sum(e['qty'] for e in execs if e['action'] == entry_action) \
+                - sum(e['qty'] for e in execs if e['action'] == exit_action)
+            if open_qty <= 0:
+                raise HTTPException(status_code=400, detail=(
+                    "This trade is already closed, so there is nothing left to exit at a price."
+                ))
+        else:
+            open_qty = quantity or sum(e['qty'] for e in execs if e['action'] == exit_action) or 1
+        last = max(execs, key=lambda e: (e.get('date', ''), e.get('time', ''))) if execs else None
+        execs.append({
+            'date': (last or {}).get('date') or trade['date'],
+            'time': (last or {}).get('time', ''),
+            'action': action,
+            'qty': open_qty,
+            'price': target,
+            'commission': 0.0,
+        })
+
+    if total_fees is not None and execs:
+        _split_fees(execs, total_fees)
+
+    return execs
+
+
+def _split_fees(execs: list, total_fees: float) -> None:
+    """Spread a total commission figure across the fills, a half cent at a time.
+
+    The journal reports one commission number for the trade and the fills each carry a slice of it,
+    the same shape the importer produces. Dividing evenly and handing the remainder to the last fill
+    keeps the sum exactly equal to what was typed, which is what net_pnl is checked against.
+    """
+    share = round(total_fees / len(execs), 2)
+    for e in execs[:-1]:
+        e['commission'] = share
+    execs[-1]['commission'] = round(total_fees - share * (len(execs) - 1), 2)
 
 
 @app.put("/api/trades/{trade_id}")
-def update_trade(trade_id: int, data: dict, conn: sqlite3.Connection = Depends(get_connection)):
+def update_trade(trade_id: int, data: TradeUpdate, conn: sqlite3.Connection = Depends(get_connection)):
     row = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Trade not found")
 
     trade = row_to_dict(row)
-    # Only update allowed fields
-    allowed = {'ticker', 'side', 'gross_pnl', 'net_pnl', 'commissions', 'date',
-               'instrument_type', 'option_expiry', 'option_strike', 'option_type'}
-    updates = {k: v for k, v in data.items() if k in allowed}
+    updates = data.model_dump(exclude_unset=True)
+
+    # P&L and fees are derived from the fills, so a typed-in number would be silently overwritten
+    # by the next fill edit. Only take them on a trade that has no fills to derive them from;
+    # entry_price, exit_price, quantity and commissions are the way to move the money instead.
+    derived = {k: updates.pop(k) for k in ('gross_pnl', 'net_pnl') if k in updates}
+    fees = updates.pop('commissions', None)
+    has_fills = trade.get('executions') not in (None, '', '[]')
+    if has_fills and any(v is not None for v in derived.values()):
+        raise HTTPException(status_code=400, detail=(
+            "P&L is calculated from this trade's fills. Change the entry or exit price instead."
+        ))
+    updates.update({k: v for k, v in derived.items() if v is not None})
+
+    pricing = {k: updates.pop(k) for k in ('entry_price', 'exit_price', 'quantity', 'time') if k in updates}
+    # Commissions are a total across the fills, like quantity: the edit form shows the total the
+    # journal reports and splits it back over the fills the same way the import splits per-fill fees.
+    if fees is not None:
+        if has_fills:
+            pricing['commissions'] = fees
+        else:
+            updates['commissions'] = fees
+
+    # The review half of the trade lives in its own table, keyed by trade_group.
+    analysis = {
+        k: updates.pop(k)
+        for k in ('strategy', 'stop_loss', 'risk_per_trade', 'notes')
+        if k in updates
+    }
+
+    if not updates and not pricing and not analysis:
+        return _trade_payload(row)
+
+    if 'account_id' in updates and updates['account_id'] != trade['account_id']:
+        if not conn.execute("SELECT id FROM accounts WHERE id=?", (updates['account_id'],)).fetchone():
+            raise HTTPException(status_code=400, detail=f"Account {updates['account_id']} not found")
+        clash = conn.execute(
+            "SELECT id FROM trades WHERE trade_group=? AND account_id=? AND id<>?",
+            (trade['trade_group'], updates['account_id'], trade_id),
+        ).fetchone()
+        if clash:
+            raise HTTPException(status_code=409, detail="That account already holds this trade.")
 
     if trade.get('source') == 'imported':
         updates['source'] = 'edited'
@@ -659,12 +1003,32 @@ def update_trade(trade_id: int, data: dict, conn: sqlite3.Connection = Depends(g
         )
         conn.commit()
 
-    row = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
-    return row_to_dict(row)
+    if analysis:
+        _write_analysis(conn, trade, analysis)
+        conn.commit()
+
+    trade = _trade_payload(conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone())
+
+    # Anything that changes how the fills are read, or the fills themselves, means the derived
+    # numbers have to be redone. An explicit date edit wins over the one the fills would imply.
+    execs = trade['executions']
+    if pricing:
+        execs = _apply_pricing(trade, execs, pricing)
+
+    if execs and (pricing or {'side', 'instrument_type', 'ticker'} & updates.keys()):
+        trade = _recalculate_and_save(
+            trade, execs, conn, trade_id, keep_date='date' in updates
+        )
+
+    return trade
 
 
-def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
-    """Recalculate P&L from executions and persist. Returns updated trade row dict."""
+def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int, keep_date: bool = False):
+    """Recalculate P&L from executions and persist. Returns updated trade row dict.
+
+    `keep_date` holds the trade's own date instead of attributing a closed trade
+    to its last exit fill, so an explicit date edit survives the recalculation.
+    """
     side = trade['side']
     instrument = trade['instrument_type']
     ticker = trade['ticker']
@@ -681,14 +1045,7 @@ def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
     else:
         avg_entry = sum(e['qty'] * e['price'] for e in entry_fills) / entry_qty
         avg_exit  = sum(e['qty'] * e['price'] for e in exit_fills)  / exit_qty
-        if instrument == 'OPTION':
-            multiplier = 100
-        elif instrument == 'FUTURE':
-            multiplier = next(
-                (v for k, v in FUTURES_MULTIPLIERS.items() if ticker.upper().startswith(k.upper())), 1
-            )
-        else:
-            multiplier = 1
+        multiplier = contract_multiplier(ticker, instrument) or 1
         gross_pnl = (avg_entry - avg_exit if side == 'SHORT' else avg_exit - avg_entry) * entry_qty * multiplier
         commissions_total = sum(e.get('commission', 0) for e in execs)
         net_pnl   = round(gross_pnl - commissions_total, 2)
@@ -698,7 +1055,7 @@ def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
 
     # Attribute closed trade to the last exit fill's date
     trade_date = trade['date']
-    if not is_open and exit_fills:
+    if not is_open and exit_fills and not keep_date:
         sorted_exits = sorted(exit_fills, key=lambda e: (e.get('date', ''), e.get('time', '')))
         trade_date = sorted_exits[-1].get('date', trade['date'])
 
@@ -707,7 +1064,7 @@ def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
         (json.dumps(execs), gross_pnl, net_pnl, commissions, trade_date, trade_id)
     )
     conn.commit()
-    return row_to_dict(conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone())
+    return _trade_payload(conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone())
 
 
 def _parse_exec_body(body: dict, fallback_date: str) -> dict:
@@ -803,29 +1160,38 @@ class AnalysisUpdate(BaseModel):
     notes: str | None = None
 
 
-@app.patch("/api/trades/{trade_group:path}/analysis")
-def update_trade_analysis(trade_group: str, data: AnalysisUpdate, conn: sqlite3.Connection = Depends(get_connection)):
-    trade = conn.execute("SELECT trade_group, ticker, date FROM trades WHERE trade_group=?", (trade_group,)).fetchone()
-    if not trade:
-        raise HTTPException(status_code=404, detail="Trade not found")
+def _write_analysis(conn: sqlite3.Connection, trade, updates: dict) -> None:
+    """Upsert into trade_analysis, creating the row if the trade has none.
 
-    updates = data.model_dump(exclude_unset=True)
-
-    existing = conn.execute("SELECT id FROM trade_analysis WHERE trade_group=?", (trade_group,)).fetchone()
+    The review half of a trade lives here rather than on the trade itself, so the Strategy tab and
+    the edit form both come through this one place.
+    """
+    existing = conn.execute(
+        "SELECT id FROM trade_analysis WHERE trade_group=?", (trade["trade_group"],)
+    ).fetchone()
     if not existing:
         conn.execute(
             "INSERT INTO trade_analysis (trade_group, ticker, date) VALUES (?,?,?)",
-            (trade_group, trade["ticker"], trade["date"])
+            (trade["trade_group"], trade["ticker"], trade["date"])
         )
 
     if updates:
         set_clause = ", ".join(f"{k}=?" for k in updates)
         conn.execute(
             f"UPDATE trade_analysis SET {set_clause} WHERE trade_group=?",
-            list(updates.values()) + [trade_group]
+            list(updates.values()) + [trade["trade_group"]]
         )
 
+
+@app.patch("/api/trades/{trade_group:path}/analysis")
+def update_trade_analysis(trade_group: str, data: AnalysisUpdate, conn: sqlite3.Connection = Depends(get_connection)):
+    trade = conn.execute("SELECT trade_group, ticker, date FROM trades WHERE trade_group=?", (trade_group,)).fetchone()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    _write_analysis(conn, trade, data.model_dump(exclude_unset=True))
     conn.commit()
+
     row = conn.execute("SELECT * FROM trade_analysis WHERE trade_group=?", (trade_group,)).fetchone()
     return row_to_dict(row) if row else {}
 

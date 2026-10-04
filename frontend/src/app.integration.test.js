@@ -65,6 +65,7 @@ jest.mock('./api', () => {
     tradesApi: withDefault({
       list: fn((params = {}) => ok(params.open_only ? [OPEN_TRADE] : [TRADE, TRADE_2])),
       addExecution: fn(() => ok({})),
+      updateExecution: fn(() => ok(TRADE)),
       getAnalysis: fn(() => ok(null)),
       getAnalysisOptions: fn(() => ok({ strategies: [], idea_sources: [] })),
       listCustomSetups: fn(() => ok([])),
@@ -196,6 +197,95 @@ test('Trade View opens Trade Details with all five tabs, back and previous/next'
   expect(screen.getByRole('button', { name: /Add Execution/ })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Edit execution 1' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Delete execution 1' })).toBeInTheDocument();
+});
+
+async function openExecutionsTab(ticker = 'TSLA') {
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
+  const row = (await screen.findAllByText(ticker))[0].closest('tr');
+  fireEvent.click(row);
+  const tablist = await screen.findByRole('tablist', { name: 'Trade review sections' });
+  fireEvent.click(within(tablist).getByRole('tab', { name: 'Executions' }));
+  return tablist;
+}
+
+test('An execution price is corrected where it is shown, without opening a panel', async () => {
+  await openExecutionsTab();
+
+  // The exit fill is the second one, so its price is the exit price of the trade.
+  fireEvent.click(screen.getByRole('button', { name: 'Edit price of execution 2' }));
+  const input = screen.getByLabelText('Price of execution 2');
+  expect(input).toHaveValue(367.07);
+
+  fireEvent.change(input, { target: { value: '370.50' } });
+  await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }); });
+
+  expect(tradesApi.updateExecution).toHaveBeenCalledWith(101, 1, expect.objectContaining({
+    action: 'SOLD', qty: 200, price: 370.5,
+  }));
+});
+
+test('Leaving a price untouched does not send a request', async () => {
+  await openExecutionsTab();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Edit price of execution 1' }));
+  const input = screen.getByLabelText('Price of execution 1');
+  await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }); });
+
+  expect(tradesApi.updateExecution).not.toHaveBeenCalled();
+});
+
+test('Escape abandons a price edit', async () => {
+  await openExecutionsTab();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Edit price of execution 2' }));
+  const input = screen.getByLabelText('Price of execution 2');
+  fireEvent.change(input, { target: { value: '999' } });
+  await act(async () => { fireEvent.keyDown(input, { key: 'Escape' }); });
+
+  expect(screen.queryByLabelText('Price of execution 2')).not.toBeInTheDocument();
+  expect(tradesApi.updateExecution).not.toHaveBeenCalled();
+  // Back to the price the fill actually has.
+  expect(screen.getByRole('button', { name: 'Edit price of execution 2' })).toHaveTextContent('$367.07');
+});
+
+test('The avg exit shown in the KPIs jumps to the exit price to correct it', async () => {
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
+  const row = (await screen.findAllByText('TSLA'))[0].closest('tr');
+  fireEvent.click(row);
+
+  // An average is not itself editable, so it hands over to the fill underneath it. The average
+  // shows in the KPI strip and again in the Stats tab; either one lands on the same fill.
+  const averages = await screen.findAllByTitle('Edit the exit price in Executions');
+  expect(averages.length).toBeGreaterThan(0);
+  fireEvent.click(averages[0]);
+  expect(await screen.findByLabelText('Price of execution 2')).toHaveValue(367.07);
+});
+
+test('An open trade offers to record the exit price it has none of', async () => {
+  // A trade with no exit fill at all, so there is nothing to correct and something to record.
+  const FLAT_OPEN = {
+    id: 104, account_id: 1, trade_group: '9/11/26_AMZN_STOCK_1', date: '2026-09-11', ticker: 'AMZN',
+    instrument_type: 'STOCK', side: 'LONG', net_pnl: null, gross_pnl: null, commissions: 0,
+    executions: [{ date: '2026-09-11', time: '10:00:00', action: 'BOT', qty: 150, price: 180, commission: 0 }],
+  };
+  tradesApi.list.mockImplementation((params = {}) =>
+    Promise.resolve({ data: params.open_only ? [FLAT_OPEN] : [FLAT_OPEN] }));
+
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
+  const row = (await screen.findAllByText('AMZN'))[0].closest('tr');
+  fireEvent.click(row);
+  const tablist = await screen.findByRole('tablist', { name: 'Trade review sections' });
+  fireEvent.click(within(tablist).getByRole('tab', { name: 'Executions' }));
+
+  const record = screen.getByRole('button', { name: /Record exit price/ });
+  fireEvent.click(record);
+
+  // Prefilled with the opposite action at the size of the position, so it closes the whole thing.
+  expect(screen.getByLabelText('New execution action')).toHaveValue('SOLD');
+  expect(screen.getByLabelText('New execution qty')).toHaveValue(150);
 });
 
 test('Import keeps broker CSV import and diary analysis, with keyboard dropzones', async () => {
@@ -353,4 +443,86 @@ test('Goals save failure is shown and keeps the panel open', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Save' }));
   expect(await screen.findByRole('alert')).toHaveTextContent(/Could not save goals: Server error/);
   expect(screen.getByRole('heading', { name: 'Goals' })).toBeInTheDocument();
+});
+
+// The x100 on an option contract. The backend already derives P&L with it, so these check the
+// browser is not quietly dropping it from the figures it shows: 10 lots at 2.00 closed at 3.00 is
+// 1000.00 of profit on 2000.00 of cost, which is 50%, not the 5000% a missing multiplier gives.
+describe('an option contract is 100 shares in every figure the UI derives', () => {
+  const fills = (entryPrice, exitPrice, qty) => [
+    { date: '2026-09-12', time: '10:00:00', action: 'BOT', qty, price: entryPrice, commission: 0 },
+    { date: '2026-09-12', time: '11:00:00', action: 'SOLD', qty, price: exitPrice, commission: 0 },
+  ];
+
+  const OPTION_TRADE = {
+    id: 201, account_id: 1, trade_group: '9/12/26_SPY_OPTION_1', date: '2026-09-12', ticker: 'SPY',
+    instrument_type: 'OPTION', side: 'LONG', option_type: 'CALL', option_strike: 570,
+    option_expiry: '2026-10-16', gross_pnl: 1000, net_pnl: 1000, commissions: 0,
+    executions: fills(2.0, 3.0, 10),
+  };
+
+  async function openStats(trade) {
+    tradesApi.list.mockImplementation(() => Promise.resolve({ data: [trade] }));
+    await renderApp();
+    fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
+    const row = (await screen.findAllByText(trade.ticker))[0].closest('tr');
+    fireEvent.click(row);
+    const tablist = await screen.findByRole('tablist', { name: 'Trade review sections' });
+    fireEvent.click(within(tablist).getByRole('tab', { name: 'Stats' }));
+    return tablist;
+  }
+
+  test('ROI is 50%, not the 5000% a missing multiplier produces', async () => {
+    await openStats(OPTION_TRADE);
+    // Shown in the KPI strip and again in the Stats tab.
+    const roi = await screen.findAllByText('+50.00%');
+    expect(roi.length).toBeGreaterThan(0);
+    expect(screen.queryByText('+5000.00%')).not.toBeInTheDocument();
+  });
+
+  test('Adjusted cost is 2000.00, the price times the shares behind the position', async () => {
+    await openStats(OPTION_TRADE);
+    // 2.00 x 10 contracts is $20 without the multiplier, and $2,000.00 with it.
+    expect((await screen.findAllByText('$2,000.00')).length).toBeGreaterThan(0);
+    expect(screen.queryByText('$20.00')).not.toBeInTheDocument();
+  });
+
+  test('Risk from the stop is scaled by the shares too', async () => {
+    tradesApi.getAnalysis.mockImplementation(() => Promise.resolve({
+      data: { analysis: { stop_loss: 1.9 }, tags: [] },
+    }));
+    await openStats(OPTION_TRADE);
+    // A 0.10 per-share stop on 10 lots is $100 of risk, not $1.
+    expect((await screen.findAllByText('-$100.00')).length).toBeGreaterThan(0);
+    expect(screen.queryByText('-$1.00')).not.toBeInTheDocument();
+  });
+
+  test('the size is labelled in contracts, not shares', async () => {
+    await openStats(OPTION_TRADE);
+    expect(await screen.findByText('Contracts traded')).toBeInTheDocument();
+    expect(screen.queryByText('Stocks traded')).not.toBeInTheDocument();
+  });
+
+  test('a stock on the same numbers keeps multiplier 1 and does not change', async () => {
+    await openStats({
+      ...OPTION_TRADE, id: 202, ticker: 'AAPL', instrument_type: 'STOCK',
+      gross_pnl: 10, net_pnl: 10, executions: fills(2.0, 3.0, 10),
+    });
+    // 10 profit on a 20 cost, the same 50% by coincidence of the numbers, but no x100 involved.
+    expect((await screen.findAllByText('+50.00%')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('$20.00')).length).toBeGreaterThan(0);
+    expect(await screen.findByText('Stocks traded')).toBeInTheDocument();
+  });
+
+  test('a future derives no ROI at all, since its multiplier is not the contract size', async () => {
+    await openStats({
+      ...OPTION_TRADE, id: 203, ticker: '/ES', instrument_type: 'FUTURE',
+      gross_pnl: 200, net_pnl: 200, executions: fills(5000, 5002, 2),
+    });
+    // 5000 x 2 is not $10,000 of cost that could divide into a meaningful ROI, so the rows are
+    // left out rather than showing a number that happens to look reasonable.
+    expect(screen.queryByText('Net ROI')).not.toBeInTheDocument();
+    expect(screen.queryByText('Adjusted Cost')).not.toBeInTheDocument();
+    expect(await screen.findByText('Contracts traded')).toBeInTheDocument();
+  });
 });
