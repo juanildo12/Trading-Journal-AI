@@ -1,18 +1,11 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "frontend/package.json", "use": "@vercel/static-build", "config": { "distDir": "build" } },
-    { "src": "api/main.py", "use": "@vercel/python" }
-  ],
   "rewrites": [
-    { "source": "/api/:path*", "destination": "/api/main.py" },
-    { "source": "/docs", "destination": "/api/main.py" },
-    { "source": "/redoc", "destination": "/api/main.py" },
-    { "source": "/openapi.json", "destination": "/api/main.py" },
-    { "source": "/uploads/:path*", "destination": "/api/main.py" },
-    { "source": "/:path*", "destination": "/frontend/build/:path*" }
-  ],
-  "overrides": [
-    { "files": ["frontend/build/**"], "serverless": false }
+    { "source": "/api/:path*", "destination": "https://trading-journal-ai-backend.onrender.com/:path*" },
+    { "source": "/docs", "destination": "https://trading-journal-ai-backend.onrender.com/docs" },
+    { "source": "/redoc", "destination": "https://trading-journal-ai-backend.onrender.com/redoc" },
+    { "source": "/openapi.json", "destination": "https://trading-journal-ai-backend.onrender.com/openapi.json" },
+    { "source": "/uploads/:path*", "destination": "https://trading-journal-ai-backend.onrender.com/uploads/:path*" },
+    { "source": "/:path*", "destination": "/index.html" }
   ]
 }
