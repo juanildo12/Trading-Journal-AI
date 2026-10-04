@@ -12,12 +12,19 @@
     }
   ],
   "routes": [
-    { "src": "/api", "dest": "/api/main.py" },
+    { "src": "/api/docs", "dest": "/api/main.py" },
+    { "src": "/api/openapi.json", "dest": "/api/main.py" },
+    { "src": "/api/redoc", "dest": "/api/main.py" },
     { "src": "/api/(.*)", "dest": "/api/main.py" },
     { "src": "/docs", "dest": "/api/main.py" },
     { "src": "/redoc", "dest": "/api/main.py" },
     { "src": "/openapi.json", "dest": "/api/main.py" },
-    { "handle": "filesystem" },
+    { "src": "/uploads/(.*)", "dest": "/api/main.py" },
+    { "src": "/static/(.*)", "dest": "/frontend/static/$1" },
+    { "src": "/favicon.ico", "dest": "/frontend/favicon.ico" },
+    { "src": "/manifest.json", "dest": "/frontend/manifest.json" },
+    { "src": "/robots.txt", "dest": "/frontend/robots.txt" },
+    { "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|json|map))$", "dest": "/frontend/$1" },
     { "src": "/(.*)", "dest": "/frontend/index.html" }
   ]
 }
