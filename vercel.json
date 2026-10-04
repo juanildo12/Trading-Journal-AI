@@ -1,30 +1,18 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": { "distDir": "build" }
-    },
-    {
-      "src": "api/main.py",
-      "use": "@vercel/python"
-    }
+    { "src": "frontend/package.json", "use": "@vercel/static-build", "config": { "distDir": "build" } },
+    { "src": "api/main.py", "use": "@vercel/python" }
   ],
-  "routes": [
-    { "src": "/api/docs", "dest": "/api/main.py" },
-    { "src": "/api/openapi.json", "dest": "/api/main.py" },
-    { "src": "/api/redoc", "dest": "/api/main.py" },
-    { "src": "/api/(.*)", "dest": "/api/main.py" },
-    { "src": "/docs", "dest": "/api/main.py" },
-    { "src": "/redoc", "dest": "/api/main.py" },
-    { "src": "/openapi.json", "dest": "/api/main.py" },
-    { "src": "/uploads/(.*)", "dest": "/api/main.py" },
-    { "src": "/static/(.*)", "dest": "/frontend/static/$1" },
-    { "src": "/favicon.ico", "dest": "/frontend/favicon.ico" },
-    { "src": "/manifest.json", "dest": "/frontend/manifest.json" },
-    { "src": "/robots.txt", "dest": "/frontend/robots.txt" },
-    { "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|json|map))$", "dest": "/frontend/$1" },
-    { "src": "/(.*)", "dest": "/frontend/index.html" }
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/main.py" },
+    { "source": "/docs", "destination": "/api/main.py" },
+    { "source": "/redoc", "destination": "/api/main.py" },
+    { "source": "/openapi.json", "destination": "/api/main.py" },
+    { "source": "/uploads/:path*", "destination": "/api/main.py" },
+    { "source": "/:path*", "destination": "/frontend/build/:path*" }
+  ],
+  "overrides": [
+    { "files": ["frontend/build/**"], "serverless": false }
   ]
 }
