@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: trading-journal-ai-backend
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
+    disk:
+      name: trading-journal-ai-data
+      mountPath: /opt/render/project/src/backend
+      sizeGB: 1
+    envVars:
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      - key: ALPACA_DATA_FEED
+        sync: false
