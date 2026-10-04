@@ -11,11 +11,13 @@
       "use": "@vercel/python"
     }
   ],
-  "rewrites": [
-    { "source": "/api/:match*", "destination": "/api/main.py" },
-    { "source": "/:match*", "destination": "/frontend/$1" }
-  ],
-  "redirects": [
-    { "source": "/api", "destination": "/api/" }
+  "routes": [
+    { "src": "/api", "dest": "/api/main.py" },
+    { "src": "/api/(.*)", "dest": "/api/main.py" },
+    { "src": "/docs", "dest": "/api/main.py" },
+    { "src": "/redoc", "dest": "/api/main.py" },
+    { "src": "/openapi.json", "dest": "/api/main.py" },
+    { "handle": "filesystem" },
+    { "src": "/(.*)", "dest": "/frontend/index.html" }
   ]
 }
