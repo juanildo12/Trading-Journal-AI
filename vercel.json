@@ -4,23 +4,19 @@
     {
       "src": "frontend/package.json",
       "use": "@vercel/static-build",
-      "config": {
-        "distDir": "build"
-      }
+      "config": { "distDir": "build" }
     },
     {
       "src": "api/index.py",
       "use": "@vercel/python"
     }
   ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.py" },
-    { "src": "/docs", "dest": "/api/index.py" },
-    { "src": "/redoc", "dest": "/api/index.py" },
-    { "src": "/openapi.json", "dest": "/api/index.py" },
-    { "src": "/uploads/(.*)", "dest": "/api/index.py" },
-    { "handle": "filesystem" },
-    { "src": "/static/(.*)", "dest": "/frontend/static/$1" },
-    { "src": "/(.*)", "dest": "/frontend/index.html" }
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.py" },
+    { "source": "/docs", "destination": "/api/index.py" },
+    { "source": "/redoc", "destination": "/api/index.py" },
+    { "source": "/openapi.json", "destination": "/api/index.py" },
+    { "source": "/uploads/(.*)", "destination": "/api/index.py" },
+    { "source": "/((?!api/|static/|_next/|favicon.ico|manifest.json|robots.txt).*)", "destination": "/frontend/index.html" }
   ]
 }
