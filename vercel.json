@@ -14,13 +14,13 @@
     }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "api/index.py" },
-    { "src": "/docs", "dest": "api/index.py" },
-    { "src": "/redoc", "dest": "api/index.py" },
-    { "src": "/openapi.json", "dest": "api/index.py" },
-    { "src": "/uploads/(.*)", "dest": "api/index.py" },
-    { "src": "/static/(.*)", "dest": "frontend/static/$1" },
-    { "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|json|map))$", "dest": "frontend/$1" },
-    { "src": "/(.*)", "dest": "frontend/index.html" }
+    { "src": "/api/(.*)", "dest": "/api/index.py" },
+    { "src": "/docs", "dest": "/api/index.py" },
+    { "src": "/redoc", "dest": "/api/index.py" },
+    { "src": "/openapi.json", "dest": "/api/index.py" },
+    { "src": "/uploads/(.*)", "dest": "/api/index.py" },
+    { "handle": "filesystem" },
+    { "src": "/static/(.*)", "dest": "/frontend/static/$1" },
+    { "src": "/(.*)", "dest": "/frontend/index.html" }
   ]
 }
