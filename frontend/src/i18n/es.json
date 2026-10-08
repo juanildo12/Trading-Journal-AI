@@ -65,5 +65,70 @@
     "add_execution": "Agregar Ejecución",
     "net_pnl": "PNL Neto",
     "gross_pnl": "PNL Bruto"
+  },
+  "trades": {
+    "ticker": "Ticker",
+    "type": "Tipo",
+    "all_types": "Todos los tipos",
+    "stock": "Acción",
+    "option": "Opción",
+    "future": "Futuro",
+    "side": "Dirección",
+    "date": "Fecha",
+    "time": "Hora",
+    "qty": "Cant.",
+    "entry": "Entrada",
+    "exit": "Salida",
+    "pnl": "PNL",
+    "net_pnl": "PNL Neto",
+    "gross_pnl": "PNL Bruto",
+    "strategy": "Estrategia",
+    "commissions": "Comisiones",
+    "stop": "Stop",
+    "r": "R",
+    "rr": "R:R",
+    "actions": "Acciones"
+  },
+  "calendar": {
+    "month": "Mes",
+    "year": "Año",
+    "upcoming": "Próximos",
+    "no_trades": "Sin trades",
+    "prof_f": "Prof. F"
+  },
+  "reports": {
+    "trades": "Trades",
+    "avg_win": "Ganancia Prom.",
+    "avg_loss": "Pérdida Prom.",
+    "exit_eff": "Eficiencia Salida",
+    "relative_size": "Tamaño Relativo"
+  },
+  "diary": {
+    "no_analysis": "Sin análisis de IA disponible.",
+    "patterns": "Patrones Identificados",
+    "improvements": "Áreas a Mejorar",
+    "trade_analyses": "Análisis de Trades"
+  },
+  "dashboard": {
+    "goals": "Objetivos"
+  },
+  "detail": {
+    "this_session": "Esta sesión",
+    "selected": "Seleccionado",
+    "back_trades": "Volver a trades",
+    "edit_trade": "Editar trade",
+    "prev_trade": "Trade anterior",
+    "next_trade": "Siguiente trade"
+  },
+  "settings": {
+    "name": "Nombre",
+    "description": "Descripción"
+  },
+  "import": {
+    "generic_cols": "Columnas de plantilla genérica",
+    "column": "Columna",
+    "needed": "Requerida",
+    "what_goes": "Qué va ahí",
+    "drop_or_click": "Arrastra y suelta, o haz clic para explorar"
   }
 }

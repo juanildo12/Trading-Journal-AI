@@ -65,5 +65,70 @@
     "add_execution": "Add Execution",
     "net_pnl": "Net PnL",
     "gross_pnl": "Gross PnL"
+  },
+  "trades": {
+    "ticker": "Ticker",
+    "type": "Type",
+    "all_types": "All Types",
+    "stock": "Stock",
+    "option": "Option",
+    "future": "Future",
+    "side": "Side",
+    "date": "Date",
+    "time": "Time",
+    "qty": "Qty",
+    "entry": "Entry",
+    "exit": "Exit",
+    "pnl": "PnL",
+    "net_pnl": "Net PnL",
+    "gross_pnl": "Gross PnL",
+    "strategy": "Strategy",
+    "commissions": "Commissions",
+    "stop": "Stop",
+    "r": "R",
+    "rr": "R:R",
+    "actions": "Actions"
+  },
+  "calendar": {
+    "month": "Month",
+    "year": "Year",
+    "upcoming": "Upcoming",
+    "no_trades": "No trades",
+    "prof_f": "Prof. F"
+  },
+  "reports": {
+    "trades": "Trades",
+    "avg_win": "Avg Win",
+    "avg_loss": "Avg Loss",
+    "exit_eff": "Exit Eff.",
+    "relative_size": "Relative size"
+  },
+  "diary": {
+    "no_analysis": "No AI analysis available.",
+    "patterns": "Patterns Identified",
+    "improvements": "Improvement Areas",
+    "trade_analyses": "Trade Analyses"
+  },
+  "dashboard": {
+    "goals": "Goals"
+  },
+  "detail": {
+    "this_session": "This session",
+    "selected": "Selected",
+    "back_trades": "Back to trades",
+    "edit_trade": "Edit trade",
+    "prev_trade": "Previous trade",
+    "next_trade": "Next trade"
+  },
+  "settings": {
+    "name": "Name",
+    "description": "Description"
+  },
+  "import": {
+    "generic_cols": "Generic template columns",
+    "column": "Column",
+    "needed": "Needed",
+    "what_goes": "What goes in it",
+    "drop_or_click": "Drag and drop, or click to browse"
   }
 }
