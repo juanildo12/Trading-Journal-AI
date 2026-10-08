@@ -1,6 +1,6 @@
 import json
 import re
-from ai_analysis import get_client, response_text
+from ai_analysis import GROQ_MODEL, get_client, response_text
 
 MODEL = "claude-opus-5"
 
@@ -133,7 +133,7 @@ def build_daily_context(conn, date: str, account_id) -> dict:
 
 def generate_daily_summary(context: dict) -> dict:
     """Call Claude to generate a structured daily summary."""
-    client = get_client()
+    provider, client = get_client()
 
     date = context["date"]
     trades = context["trades"]
@@ -187,12 +187,22 @@ Trades:
 
 Generate the daily coaching summary JSON."""
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=DAILY_SUMMARY_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=4096,
+            messages=[
+                {'role': 'system', 'content': DAILY_SUMMARY_PROMPT},
+                {'role': 'user', 'content': user_content},
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model='claude-opus-5',
+            max_tokens=4096,
+            system=DAILY_SUMMARY_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
 
     raw = response_text(response)
     if raw.startswith("```"):

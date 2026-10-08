@@ -17,6 +17,33 @@ FUTURES_MULTIPLIERS = {
     '/YM': 5, '/MYM': 0.5, '/RTY': 50, '/M2K': 5,
 }
 
+# One option contract is 100 shares. This is the multiplier people leave out: a 10-lot option
+# trade moves 1000 shares, not 10, so every P&L that touches an option goes through it.
+OPTION_SHARES_PER_CONTRACT = 100
+
+
+def contract_multiplier(ticker: str, instrument_type: str, override: float | None = None) -> float | None:
+    """How many shares, or dollars a point, sit behind one unit of this instrument.
+
+    STOCK is 1. OPTION is 100 shares a contract. FUTURE is quoted per point, so the multiplier is
+    the contract's dollar value per point and depends on the root.
+
+    Returns None for a future whose root is not in FUTURES_MULTIPLIERS, so a caller that must not
+    guess — the CSV importers — can refuse the row. Callers that are re-reading a trade already
+    stored in the database fall back to 1, the same as the price move they are working from.
+    """
+    if override is not None:
+        return float(override)
+    if instrument_type == 'OPTION':
+        return OPTION_SHARES_PER_CONTRACT
+    if instrument_type != 'FUTURE':
+        return 1
+    # Longest root first, so /MES wins over /ES.
+    for root in sorted(FUTURES_MULTIPLIERS, key=len, reverse=True):
+        if ticker.upper().startswith(root):
+            return FUTURES_MULTIPLIERS[root]
+    return None
+
 
 def normalize_date(date_str: str) -> str:
     """Convert M/D/YY or M/D/YYYY to YYYY-MM-DD."""
@@ -765,14 +792,7 @@ def _raw_date(iso_date: str) -> str:
 
 
 def _point_value(ticker: str, instr: str):
-    if instr == 'OPTION':
-        return 100
-    if instr != 'FUTURE':
-        return 1
-    for root in sorted(FUTURES_MULTIPLIERS, key=len, reverse=True):
-        if ticker.upper().startswith(root):
-            return FUTURES_MULTIPLIERS[root]
-    return None
+    return contract_multiplier(ticker, instr)
 
 
 def overlapping_db_fills(conn, account_id: int, new_execs: list[dict]) -> tuple[list[dict], set[str]]:
@@ -1321,10 +1341,7 @@ def _generic_asset(value, symbol):
 
 def _futures_multiplier(ticker):
     """Longest known root that prefixes the contract, so /MES wins over /ES."""
-    for root in sorted(FUTURES_MULTIPLIERS, key=len, reverse=True):
-        if ticker.upper().startswith(root):
-            return FUTURES_MULTIPLIERS[root]
-    return None
+    return contract_multiplier(ticker, 'FUTURE')
 
 
 def _num(text):

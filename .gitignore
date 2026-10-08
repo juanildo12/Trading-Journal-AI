@@ -26,3 +26,4 @@ backend/uploads/
 
 # windows shortcuts
 *.lnk
+.vercel

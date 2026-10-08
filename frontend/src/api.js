@@ -38,6 +38,7 @@ export const importApi = {
   uploadDiary: (formData) => api.post('/api/upload-diary', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
+  logTradeFromText: (data) => api.post('/api/diary/trade-text', data),
 };
 
 export const kpisApi = {

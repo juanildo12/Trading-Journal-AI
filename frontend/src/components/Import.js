@@ -174,6 +174,14 @@ export default function Import({ accounts, accountId }) {
   const [diaryResult, setDiaryResult] = useState(null);
   const [diaryError, setDiaryError] = useState(null);
 
+  // Free-text trade note state
+  const [diaryMode, setDiaryMode] = useState('file');
+  const [tradeNote, setTradeNote] = useState('');
+  const [noteQuantity, setNoteQuantity] = useState('');
+  const [askingQuantity, setAskingQuantity] = useState(false);
+  const [noteResult, setNoteResult] = useState(null);
+  const [noteError, setNoteError] = useState(null);
+
   const handleCsvImport = async () => {
     if (!csvFile || !csvAccountId) {
       setCsvError('Please select a file and an account.');
@@ -216,6 +224,47 @@ export default function Import({ accounts, accountId }) {
       }
     } catch (e) {
       setDiaryError(e.response?.data?.error || e.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const handleLogTradeNote = async (e) => {
+    e?.preventDefault();
+    const qty = noteQuantity.trim() === '' ? null : Number(noteQuantity);
+    if (askingQuantity && (!qty || qty < 1 || !Number.isInteger(qty))) {
+      setNoteError('Enter how many shares or contracts you traded.');
+      return;
+    }
+    if (!tradeNote.trim() || !diaryAccountId || !diaryDate) {
+      setNoteError('Write your trade, pick an account and a date.');
+      return;
+    }
+    setAnalyzing(true);
+    setNoteError(null);
+    try {
+      const res = await importApi.logTradeFromText({
+        account_id: Number(diaryAccountId),
+        date: diaryDate,
+        text: tradeNote,
+        quantity: qty,
+      });
+      setNoteResult(res.data);
+      setAskingQuantity(false);
+      setNoteQuantity('');
+      setTradeNote('');
+    } catch (err) {
+      const detail = err.response?.data?.detail;
+      // The note left out the size, or the ticker traded twice that day. Either way
+      // the backend tells us which, and the trader answers instead of the AI guessing.
+      if (detail && detail.missing) {
+        setAskingQuantity(true);
+        setNoteError(detail.message);
+      } else if (detail && detail.candidates) {
+        setNoteError(detail.message);
+      } else {
+        setNoteError(detail || err.message);
+      }
     } finally {
       setAnalyzing(false);
     }
@@ -322,6 +371,132 @@ export default function Import({ accounts, accountId }) {
             Analyze Trading Diary
           </h2>
 
+          <div role="tablist" aria-label="Diary input" style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={diaryMode === 'file'}
+              className={diaryMode === 'file' ? 'btn btn-primary btn-sm' : 'btn btn-ghost btn-sm'}
+              onClick={() => setDiaryMode('file')}
+            >
+              <Upload size={14} /> Upload file
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={diaryMode === 'text'}
+              className={diaryMode === 'text' ? 'btn btn-primary btn-sm' : 'btn btn-ghost btn-sm'}
+              onClick={() => setDiaryMode('text')}
+            >
+              <FileText size={14} /> Write the trade
+            </button>
+          </div>
+
+          {diaryMode === 'text' ? (
+            <form onSubmit={handleLogTradeNote}>
+              <label className="field-label" htmlFor="imp-trade-note">Describe the trade in your own words</label>
+              <textarea
+                id="imp-trade-note"
+                rows={5}
+                value={tradeNote}
+                onChange={e => setTradeNote(e.target.value)}
+                placeholder={'e.g. Buy 2 calls SKHY 200 expiring Oct 9 at 1.30, waited for the EMA 8 pullback. Sold at 2.49 with a stop limit after the target hit.'}
+                style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit', fontSize: 14 }}
+              />
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginTop: 12 }}>
+                <div>
+                  <label className="field-label" htmlFor="imp-note-date">Date</label>
+                  <input
+                    id="imp-note-date"
+                    type="date"
+                    value={diaryDate}
+                    onChange={e => setDiaryDate(e.target.value)}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div>
+                  <label className="field-label" htmlFor="imp-note-account">Account</label>
+                  <select
+                    id="imp-note-account"
+                    value={diaryAccountId}
+                    onChange={e => setDiaryAccountId(e.target.value)}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="">Select account...</option>
+                    {accounts.map(a => (
+                      <option key={a.id} value={a.id}>{a.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="field-label" htmlFor="imp-note-qty">
+                    {askingQuantity ? 'Shares / contracts *' : 'Shares / contracts'}
+                  </label>
+                  <input
+                    id="imp-note-qty"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={noteQuantity}
+                    onChange={e => setNoteQuantity(e.target.value)}
+                    placeholder="Optional if you say it"
+                    style={{ width: '100%' }}
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                className="btn btn-primary"
+                style={{ width: '100%', justifyContent: 'center', marginTop: 16 }}
+                disabled={analyzing || !tradeNote.trim() || !diaryAccountId || !diaryDate}
+              >
+                {analyzing
+                  ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Reading your trade...</>
+                  : <><CheckCircle size={16} /> Log this trade</>
+                }
+              </button>
+
+              {noteResult && (
+                <div className="notice pos" role="status" style={{ marginTop: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--result-pos)', fontWeight: 600, marginBottom: 4 }}>
+                    <CheckCircle size={16} />
+                    {noteResult.created ? 'Trade logged' : 'Analysis added to your imported trade'}
+                  </div>
+                  <div style={{ fontSize: 14 }}>
+                    {noteResult.trade.ticker} {noteResult.trade.instrument_type} {noteResult.trade.side}
+                    {noteResult.trade.option_type ? ` ${noteResult.trade.option_type}` : ''}
+                    {noteResult.trade.option_strike ? ` ${noteResult.trade.option_strike}` : ''}
+                    {noteResult.trade.option_expiry ? ` exp ${noteResult.trade.option_expiry}` : ''}
+                  </div>
+                  <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
+                    Net P&amp;L ${Number(noteResult.trade.net_pnl || 0).toFixed(2)} ·{' '}
+                    {noteResult.created
+                      ? 'Saved as a new trade.'
+                      : 'You had already imported this one, so only the setup, stop and reasons were added.'}
+                  </div>
+                </div>
+              )}
+
+              {noteError && (
+                <div className="notice neg" role="alert" style={{ marginTop: 12 }}>
+                  <AlertCircle size={14} style={{ marginRight: 6, verticalAlign: 'middle' }} />{noteError}
+                  {askingQuantity && (
+                    <div style={{ marginTop: 6, fontSize: 13 }}>
+                      Put the size above and press Log this trade again.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-secondary)' }}>
+                AI fills in ticker, side, prices, strike, expiry, setup, stop, target and your reasons.
+                If it cannot work out how many you traded it asks instead of guessing.
+              </div>
+            </form>
+          ) : (
+            <>
           {diaryFile ? (
             <div style={{ marginBottom: 12 }}>
               {/\.(txt|csv)$/i.test(diaryFile.name) ? (
@@ -413,6 +588,8 @@ export default function Import({ accounts, accountId }) {
           <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-secondary)' }}>
             Claude AI will read your handwritten or typed notes and extract strategy, stops, R-multiples, emotional state, and more.
           </div>
+            </>
+          )}
         </section>
       </div>
     </div>

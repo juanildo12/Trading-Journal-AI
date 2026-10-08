@@ -26,6 +26,10 @@ from ai_analysis import (
     build_brain_context,
     generate_brain_response,
     generate_weekly_summary,
+    extract_trade_from_text,
+    find_matching_trade,
+    row_to_trade,
+    normalize_strategy,
 )
 from daily_summary import build_daily_context, generate_daily_summary
 from library import router as library_router, init_library_tables, apply_aliases, library_names
@@ -1537,6 +1541,189 @@ async def upload_diary(
         result['trade_count'] = len(analysis.get('trade_analyses', [])) if analysis else 0
 
     return result
+
+
+# ── Free-text trade logging ────────────────────────────────────────────────────
+
+class TradeTextCreate(BaseModel):
+    account_id: int
+    date: str
+    text: str
+    # Sent on the second call when the first one came back asking for it.
+    quantity: int | None = None
+
+
+@app.post("/api/diary/trade-text")
+def log_trade_from_text(data: TradeTextCreate, conn: sqlite3.Connection = Depends(get_connection)):
+    """Turn a free-text trade note into a real trade.
+
+    The model fills in what the note states and leaves the rest null. Anything the
+    note cannot answer comes back as a 422 with `missing`, so the UI can ask the
+    trader instead of the trade landing in the DB with an invented size.
+
+    When the broker already imported this position the analysis is attached to it
+    instead of creating a second trade for the same fill.
+    """
+    account = conn.execute("SELECT id FROM accounts WHERE id=?", (data.account_id,)).fetchone()
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account {data.account_id} not found")
+
+    text = (data.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Write something about the trade first")
+
+    parsed = extract_trade_from_text(text, data.date)
+
+    ticker = (parsed.get('ticker') or '').strip().upper()
+    quantity = data.quantity or parsed.get('quantity')
+
+    missing = []
+    if not ticker:
+        missing.append('ticker')
+    if not quantity:
+        # Quantity drives the P&L, so it is never guessed at.
+        missing.append('quantity')
+    if not parsed.get('entry_price'):
+        missing.append('entry_price')
+    if missing:
+        raise HTTPException(status_code=422, detail={
+            'missing': missing,
+            'parsed': parsed,
+            'message': 'The note did not say: ' + ', '.join(missing),
+        })
+
+    quantity = int(quantity)
+    entry_price = float(parsed['entry_price'])
+    exit_price = parsed.get('exit_price')
+    exit_price = float(exit_price) if exit_price is not None else None
+    instrument_type = (parsed.get('instrument_type') or 'STOCK').upper()
+    side = (parsed.get('side') or 'LONG').upper()
+
+    existing, ambiguous = find_matching_trade(conn, data.date, data.account_id, ticker, instrument_type)
+    if ambiguous:
+        raise HTTPException(status_code=409, detail={
+            'message': f'{ticker} has more than one trade on {data.date}. '
+                       'Say which one in the note (time, size or price) and log it again.',
+            'parsed': parsed,
+            'candidates': [
+                row_to_trade(r) for r in conn.execute(
+                    "SELECT * FROM trades WHERE date=? AND account_id=? AND UPPER(ticker)=?",
+                    (data.date, data.account_id, ticker),
+                ).fetchall()
+            ],
+        })
+
+    # The note itself is a diary entry, so the Diary page keeps the original words.
+    cursor = conn.execute(
+        "INSERT INTO diary_entries (account_id, entry_date, raw_text) VALUES (?,?,?)",
+        (data.account_id, data.date, text)
+    )
+    conn.commit()
+    diary_entry_id = cursor.lastrowid
+
+    analysis = {
+        'diary_date': data.date,
+        'overall_summary': text,
+        'trade_analyses': [{
+            'ticker': ticker,
+            'strategy': parsed.get('strategy'),
+            'stop_loss': parsed.get('stop_loss'),
+            'target_price': parsed.get('target_price'),
+            'risk_per_trade': parsed.get('risk_per_trade'),
+            'risk_reward': parsed.get('risk_reward'),
+            'r_multiple': parsed.get('r_multiple'),
+            'entry_reason': parsed.get('entry_reason'),
+            'exit_reason': parsed.get('exit_reason'),
+            'mistakes': parsed.get('mistakes'),
+            'emotional_state': parsed.get('emotional_state'),
+            'notes': parsed.get('notes'),
+            'ai_feedback': parsed.get('ai_feedback'),
+            'idea_source': parsed.get('idea_source'),
+            'tags': parsed.get('tags') or [],
+        }],
+    }
+
+    created = existing is None
+
+    if created:
+        commissions = float(parsed.get('commissions') or 0.0)
+        gross_pnl, net_pnl = compute_manual_pnl(
+            side, entry_price, exit_price, quantity, commissions, ticker, instrument_type
+        )
+
+        trade_time = parsed.get('entry_time') or datetime.now().strftime("%H:%M:%S")
+        trade_group = f"{data.date}_{ticker}_{instrument_type}_{trade_time.replace(':', '')}"
+        # Two notes on the same ticker in the same minute would collide on the
+        # UNIQUE(trade_group, account_id) constraint; walk the suffix until free.
+        suffix = 0
+        while conn.execute(
+            "SELECT 1 FROM trades WHERE trade_group=? AND account_id=?",
+            (trade_group, data.account_id)
+        ).fetchone():
+            suffix += 1
+            trade_group = f"{data.date}_{ticker}_{instrument_type}_{trade_time.replace(':', '')}_{suffix}"
+
+        executions = [{
+            'time': trade_time,
+            'action': 'BOT' if side == 'LONG' else 'SOLD',
+            'qty': quantity,
+            'price': entry_price,
+            'commission': commissions / 2,
+        }]
+        if exit_price is not None:
+            executions.append({
+                'time': trade_time,
+                'action': 'SOLD' if side == 'LONG' else 'BOT',
+                'qty': quantity,
+                'price': exit_price,
+                'commission': commissions / 2,
+            })
+
+        conn.execute("""
+            INSERT INTO trades
+                (account_id, trade_group, date, ticker, instrument_type, side,
+                 gross_pnl, net_pnl, commissions, executions,
+                 option_expiry, option_strike, option_type, source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            data.account_id, trade_group, data.date, ticker, instrument_type, side,
+            gross_pnl, net_pnl, commissions, json.dumps(executions),
+            parsed.get('option_expiry'),
+            parsed.get('option_strike'),
+            (parsed.get('option_type') or '').upper() or None,
+            'diary',
+        ))
+        conn.commit()
+
+        trade = row_to_trade(conn.execute(
+            "SELECT * FROM trades WHERE trade_group=? AND account_id=?",
+            (trade_group, data.account_id)
+        ).fetchone())
+    else:
+        trade_group = existing['trade_group']
+        trade = existing
+
+    analysis['trade_analyses'][0]['trade_group'] = trade_group
+    analysis['trade_analyses'][0]['match_confidence'] = 'manual' if created else 'high'
+    analysis['trade_analyses'][0]['match_notes'] = (
+        'Logged from a free-text note.' if created
+        else 'Matched to the trade already imported for this ticker on this date.'
+    )
+
+    conn.execute(
+        "UPDATE diary_entries SET ai_analysis=? WHERE id=?",
+        (json.dumps(analysis), diary_entry_id)
+    )
+    conn.commit()
+    save_analysis_to_db(conn, diary_entry_id, analysis)
+
+    return {
+        'created': created,
+        'trade_group': trade_group,
+        'trade': trade,
+        'parsed': parsed,
+        'diary_entry_id': diary_entry_id,
+    }
 
 
 # ── Diary List ─────────────────────────────────────────────────────────────────

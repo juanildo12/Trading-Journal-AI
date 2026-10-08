@@ -1,14 +1,24 @@
 import anthropic
 import base64
 import json
+import mimetypes
 import os
 import re
+from datetime import date as _date, datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    from groq import Groq
+except Exception:  # pragma: no cover
+    Groq = None
+
 MODEL = "claude-opus-5"
+# Groq's free tier. Override with GROQ_MODEL to switch (e.g. qwen/qwen3.8-27b).
+# Note: llama-3.3-70b-versatile was retired and now 404s.
+GROQ_MODEL = os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b"
 
 DIARY_SYSTEM_PROMPT = """You are an expert trading coach analyzing a trader's handwritten or typed diary entry.
 
@@ -146,24 +156,38 @@ def normalize_strategy(raw):
     return t
 
 
-def get_client() -> anthropic.Anthropic:
+def get_client():
+    """Return either a Groq client or an Anthropic client based on available env vars.
+
+    If GROQ_API_KEY is present, prefer Groq so you can run AI analysis without paying for Anthropic.
+    Otherwise fall back to ANTHROPIC_API_KEY. Existing calls continue to work.
+    """
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and Groq is not None:
+        return "groq", Groq(api_key=groq_key)
+
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key or api_key == "your_anthropic_api_key_here":
         raise ValueError("ANTHROPIC_API_KEY is not set in .env file")
-    return anthropic.Anthropic(api_key=api_key)
+    return "anthropic", anthropic.Anthropic(api_key=api_key)
 
 
 
 def response_text(response) -> str:
-    """Concatenate the text blocks of a Messages API response.
-
-    `response.content` is a list of blocks and the FIRST one is not necessarily
-    text. On Claude Opus 5 adaptive thinking is on by default, so content[0] is
-    typically a ThinkingBlock — indexing it raises
-    "'ThinkingBlock' object has no attribute 'text'". Always select by .type.
-    """
-    parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    return "".join(parts).strip()
+    """Concatenate the text blocks of a Messages API response."""
+    # Anthropic: response.content contains blocks with .type and .text
+    try:
+        if hasattr(response, "content") and isinstance(response.content, list):
+            parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+            if parts:
+                return "".join(parts).strip()
+    except Exception:
+        pass
+    # Groq/OpenAI compatible: choices[0].message.content
+    try:
+        return response.choices[0].message.content.strip()  # type: ignore
+    except Exception:
+        return str(response).strip()
 
 
 # The per-trade JSON grows with the number of diary lines, and on Opus 5 adaptive
@@ -174,17 +198,15 @@ DIARY_MAX_TOKENS = 16000
 
 
 def raise_if_truncated(response, what: str = "analysis") -> None:
-    """Fail loudly when the model hit the token ceiling.
-
-    Without this the caller parses a half-written JSON string and surfaces
-    "Unterminated string starting at: line N column M", which points at the
-    output rather than the cause.
-    """
-    if getattr(response, "stop_reason", None) == "max_tokens":
-        raise ValueError(
-            f"The {what} response hit the {DIARY_MAX_TOKENS}-token limit and was cut off. "
-            "Split the diary into fewer trades per run, or raise DIARY_MAX_TOKENS."
-        )
+    """Fail loudly when the model hit the token ceiling."""
+    try:
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError(
+                f"The {what} response hit the {DIARY_MAX_TOKENS}-token limit and was cut off. "
+                "Split the diary into fewer trades per run, or raise DIARY_MAX_TOKENS."
+            )
+    except Exception:
+        pass
 
 
 def analyze_diary_entry(image_path: str, entry_date: str, trades_context: list[dict]) -> dict:
@@ -201,7 +223,7 @@ def analyze_diary_entry(image_path: str, entry_date: str, trades_context: list[d
         Parsed dict with diary_date, overall_summary, patterns_identified,
         improvement_areas, trade_analyses
     """
-    client = get_client()
+    provider, client = get_client()
 
     # Read and encode image
     image_bytes = Path(image_path).read_bytes()
@@ -245,30 +267,43 @@ Please analyze this trading diary screenshot. For each trade you find mentioned:
 
 Return only the JSON object."""
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=DIARY_MAX_TOKENS,
-        system=DIARY_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_b64,
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            messages=[
+                {'role': 'system', 'content': DIARY_SYSTEM_PROMPT},
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': user_text},
+                        {'type': 'image_url', 'image_url': {'url': f'data:{media_type};base64,{image_b64}'}},
+                    ],
+                },
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            system=DIARY_SYSTEM_PROMPT,
+            messages=[
+                {
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'image',
+                            'source': {
+                                'type': 'base64',
+                                'media_type': media_type,
+                                'data': image_b64,
+                            },
                         },
-                    },
-                    {
-                        "type": "text",
-                        "text": user_text,
-                    }
-                ],
-            }
-        ],
-    )
+                        {'type': 'text', 'text': user_text},
+                    ],
+                }
+            ],
+        )
 
     raise_if_truncated(response, "diary photo analysis")
     return _parse_response(response_text(response), entry_date)
@@ -276,7 +311,7 @@ Return only the JSON object."""
 
 def analyze_diary_text(text_content: str, entry_date: str, trades_context: list[dict]) -> dict:
     """Analyze typed/CSV diary notes (no image) using Claude text API."""
-    client = get_client()
+    provider, client = get_client()
 
     context_lines = []
     for t in trades_context:
@@ -290,13 +325,7 @@ def analyze_diary_text(text_content: str, entry_date: str, trades_context: list[
         context_lines.append(line)
     trades_context_str = '\n'.join(context_lines) if context_lines else "No trades found for this date."
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=DIARY_MAX_TOKENS,
-        system=DIARY_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"""Entry date: {entry_date}
+    user_text = f"""Entry date: {entry_date}
 
 Trades executed on this date (match diary lines to these):
 {trades_context_str}
@@ -306,8 +335,26 @@ Typed diary notes to analyze:
 
 Parse each diary line, match to the trade records above, and return the JSON analysis.
 For each "Source: X" note create a tag with type "source". Return only the JSON object."""
-        }],
-    )
+
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            messages=[
+                {'role': 'system', 'content': DIARY_SYSTEM_PROMPT},
+                {'role': 'user', 'content': user_text},
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            system=DIARY_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": user_text,
+            }],
+        )
 
     raise_if_truncated(response, "diary analysis")
     raw = response_text(response)
@@ -492,20 +539,24 @@ def generate_insights(trades_summary: dict) -> str:
     Generate AI coaching insights from aggregated performance data.
     Returns markdown-formatted text.
     """
-    client = get_client()
-
+    provider, client = get_client()
     summary_text = json.dumps(trades_summary, indent=2)
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        messages=[
-            {
-                "role": "user",
-                "content": f"{INSIGHTS_PROMPT}\n\nPerformance Data:\n```json\n{summary_text}\n```"
-            }
-        ],
-    )
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=2048,
+            messages=[
+                {'role': 'system', 'content': INSIGHTS_PROMPT},
+                {'role': 'user', 'content': f"Performance Data:\n```json\n{summary_text}\n```"},
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": f"{INSIGHTS_PROMPT}\n\nPerformance Data:\n```json\n{summary_text}\n```"}],
+        )
 
     return response_text(response)
 
@@ -653,8 +704,6 @@ Required JSON schema:
 
 def generate_weekly_summary(week_context: dict) -> dict:
     """Call Claude to generate a weekly behavioral synthesis."""
-    client = get_client()
-
     trades = week_context["trades"]
     week_label = week_context["week_label"]
 
@@ -690,6 +739,8 @@ def generate_weekly_summary(week_context: dict) -> dict:
     avg_win_str = f"${sum(wins)/len(wins):.2f}" if wins else "N/A"
     avg_loss_str = f"${sum(losses)/len(losses):.2f}" if losses else "N/A"
 
+    provider, client = get_client()
+
     user_content = (
         f"Week: {week_label}\n"
         f"Total P&L: ${sum(all_pnl):.2f} | Trades: {total} | "
@@ -699,12 +750,22 @@ def generate_weekly_summary(week_context: dict) -> dict:
         + "\n\nGenerate the weekly behavioral synthesis JSON."
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=WEEKLY_SUMMARY_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=2048,
+            messages=[
+                {'role': 'system', 'content': WEEKLY_SUMMARY_PROMPT},
+                {'role': 'user', 'content': user_content},
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=WEEKLY_SUMMARY_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
 
     raw = response_text(response)
     if raw.startswith("```"):
@@ -719,7 +780,7 @@ def generate_weekly_summary(week_context: dict) -> dict:
 
 def generate_brain_response(messages: list[dict], context: str) -> str:
     """Send full conversation history + trade context to Claude Brain."""
-    client = get_client()
+    provider, client = get_client()
 
     claude_messages = []
     context_injected = False
@@ -731,10 +792,167 @@ def generate_brain_response(messages: list[dict], context: str) -> str:
             context_injected = True
         claude_messages.append({"role": role, "content": content})
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        system=BRAIN_SYSTEM_PROMPT,
-        messages=claude_messages,
-    )
+    if provider == 'groq':
+        system = BRAIN_SYSTEM_PROMPT
+        groq_msgs = []
+        for m in claude_messages:
+            groq_msgs.append({'role': m['role'], 'content': m['content']})
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=2048,
+            messages=[{'role': 'system', 'content': system}] + groq_msgs,
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=BRAIN_SYSTEM_PROMPT,
+            messages=claude_messages,
+        )
     return response_text(response)
+
+
+# ── Free-text trade logging ───────────────────────────────────────────────────
+# The diary prompts above MATCH a note against broker imports. This one is the
+# opposite direction: the trader describes a trade in prose and we build the
+# record from scratch. Fields the note does not state stay null so the caller can
+# ask the trader rather than invent a number that ends up in the P&L.
+
+TRADE_TEXT_PROMPT = """You turn a trader's free-text note about ONE trade into a structured record.
+
+Today is {today}. The trade is being logged for {entry_date}.
+
+Return ONLY a JSON object. No markdown, no commentary, no code fence.
+
+## Schema
+{{
+  "ticker": "SKHY",
+  "instrument_type": "STOCK",
+  "side": "LONG",
+  "quantity": null,
+  "entry_price": 1.30,
+  "exit_price": 2.49,
+  "entry_time": null,
+  "option_type": null,
+  "option_strike": null,
+  "option_expiry": null,
+  "strategy": null,
+  "stop_loss": null,
+  "target_price": null,
+  "r_multiple": null,
+  "entry_reason": null,
+  "exit_reason": null,
+  "mistakes": null,
+  "emotional_state": null,
+  "notes": null,
+  "tags": []
+}}
+
+## Rules
+- The note covers exactly ONE trade. If it rambles onto a second one, take the main one.
+- `instrument_type` is "OPTION" only when the note names a call, put, strike or expiry. Otherwise "STOCK".
+- `side` is "LONG" unless the note says short, sold, bearish or "para bajar".
+- Option prices are per-share premiums as quoted (1.30, 2.49). Never multiply by 100 here.
+- Resolve relative dates against {today}: "esta semana", "el 9 de octubre", "next friday" → "YYYY-MM-DD".
+- `quantity` is the number of shares or contracts ONLY if the note states it ("3 contratos", "10 shares").
+  A round number you infer from nothing is not a quantity. Otherwise null.
+- `strategy`: use the canonical playbook name when the note names one — Opening Drive, VWAP Reclaim,
+  Range Break, Trend Pullback. Otherwise describe the setup in free text ("espera EMA 8 pullback").
+- `tags`: objects {{"type": "...", "value": "..."}} with type in
+  strategy, setup, execution, mistake, emotion, outcome, source.
+  Use the Setup Vocabulary and Tag Type Guidelines from the diary schema above.
+- Use null for anything the note does not state. NEVER invent a number.
+"""
+
+
+def _strip_json_fence(raw: str) -> str:
+    """Drop the ```json fence some models wrap their output in."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+    return raw.strip()
+
+
+def extract_trade_from_text(text_content: str, entry_date: str, today: str | None = None) -> dict:
+    """Parse one free-text trade note into a structured record.
+
+    Returns the model's dict, normalised: `strategy` is mapped onto the playbook
+    vocabulary and `tags` is guaranteed to be a list. Unstated fields remain None
+    so the caller can ask the trader instead of guessing.
+    """
+    provider, client = get_client()
+
+    today = today or _date.today().isoformat()
+    system = TRADE_TEXT_PROMPT.format(today=today, entry_date=entry_date)
+
+    user_text = (
+        f"Trade date: {entry_date}\n"
+        f"Today: {today}\n\n"
+        f"Trader's note:\n{text_content}\n\n"
+        "Return only the JSON object."
+    )
+
+    if provider == 'groq':
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            messages=[
+                {'role': 'system', 'content': system},
+                {'role': 'user', 'content': user_text},
+            ],
+        )
+    else:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=DIARY_MAX_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user_text}],
+        )
+
+    parsed = json.loads(_strip_json_fence(response_text(response)))
+
+    parsed['strategy'] = normalize_strategy(parsed.get('strategy'))
+    if not isinstance(parsed.get('tags'), list):
+        parsed['tags'] = []
+    return parsed
+
+
+def find_matching_trade(conn, entry_date: str, account_id: int, ticker: str,
+                        instrument_type: str | None = None) -> tuple[dict | None, bool]:
+    """Find a broker trade this note is describing, so it enriches instead of duplicating.
+
+    Returns (trade, is_ambiguous). `is_ambiguous` is True when the ticker traded more
+    than once that day, because then the note cannot be pinned to one of them and
+    guessing would silently attach the analysis to the wrong position.
+    """
+    if not ticker:
+        return None, False
+
+    rows = conn.execute(
+        "SELECT * FROM trades WHERE date = ? AND account_id = ? AND UPPER(ticker) = ?",
+        (entry_date, account_id, ticker.upper())
+    ).fetchall()
+
+    if not rows:
+        return None, False
+
+    wanted = (instrument_type or '').upper()
+    if wanted:
+        narrowed = [r for r in rows if (r['instrument_type'] or '').upper() == wanted]
+        # A ticker can appear as both the stock and its option; the note's
+        # instrument_type is what separates them.
+        if narrowed:
+            rows = narrowed
+
+    if len(rows) > 1:
+        return None, True
+
+    return row_to_trade(rows[0]), False
+
+
+def row_to_trade(row) -> dict:
+    """Row -> dict with `executions` decoded, matching the shape the API returns."""
+    trade = dict(row)
+    trade['executions'] = json.loads(trade.get('executions') or '[]')
+    return trade

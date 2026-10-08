@@ -5,6 +5,8 @@ import {
 } from 'lucide-react';
 import { accountsApi } from '../api';
 import aiJournalLogo from '../assets/ai-journal-logo.png';
+import LangSwitch from './LangSwitch';
+
 
 // Every page stays one click away. Import, Brain and Add Trade live with the
 // account selector on the right, the rest are the labeled navigation.
@@ -278,6 +280,7 @@ export default function AppHeader({
           <button type="button" className="btn btn-primary" onClick={onAddTrade}>
             <Plus size={16} aria-hidden="true" /> Add Trade
           </button>
+          <LangSwitch />
         </div>
       </div>
     </header>
